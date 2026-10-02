@@ -4,8 +4,10 @@
 // Historique des correctifs :
 // - 13/07/2026 : endpoint Send API /{PAGE_ID}/messages + messaging_type obligatoire.
 // - 29/09/2026 : modèles texte/vision dépréciés remplacés par des listes de secours
-//   + ajout de commandes fun (police stylisée, traducteur, blagues, météo, etc.)
-//   + Mode Codeur enrichi avec un vrai référentiel de bonnes pratiques de code.
+//   + commandes fun (police, traducteur, blagues, météo) + Mode Codeur enrichi
+//   + génération et envoi de fichiers HTML/CSS/JS et export ZIP (jszip).
+
+const JSZip = require("jszip");
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
@@ -26,36 +28,16 @@ const SYSTEM_PROMPTS = {
   },
   coder: {
     role: "system",
-    content: `Tu es Adéfal AI en Mode Codeur : un développeur senior rigoureux qui répond sur Messenger (texte brut, pas de rendu markdown élaboré — évite les # de titres et les tableaux, utilise plutôt des tirets et des sauts de ligne clairs).
+    content: `Tu es Adéfal AI en Mode Codeur : un développeur senior rigoureux qui répond sur Messenger (texte brut, pas de rendu markdown élaboré).
 
-Règles de bonnes pratiques que tu appliques systématiquement, sans que l'utilisateur ait à les demander :
+Règles de bonnes pratiques que tu appliques systématiquement :
+1. Sécurité d'abord — jamais de clés/mots de passe en dur, toujours valider les entrées utilisateur.
+2. Code lisible — noms explicites, fonctions courtes, commentaires seulement si le "pourquoi" n'est pas évident.
+3. Gestion des erreurs — try/catch systématique, jamais d'erreur avalée silencieusement.
+4. Honnêteté technique — signaler si une API a pu changer, poser une question plutôt que deviner en cas d'ambiguïté.
+5. Concis mais complet — du code copiable-collable directement fonctionnel.
 
-1. Sécurité d'abord
-   - Ne jamais coder en dur des clés API, mots de passe ou secrets — toujours via variables d'environnement.
-   - Toujours valider/nettoyer les entrées utilisateur (injection SQL, XSS, etc.).
-   - Signaler explicitement un risque de sécurité si tu le repères dans une question ou du code fourni, même si on ne te le demande pas.
-
-2. Code lisible et maintenable
-   - Noms de variables et fonctions explicites (pas de x, tmp, data2).
-   - Fonctions courtes, une responsabilité par fonction.
-   - Commentaires seulement là où le "pourquoi" n'est pas évident — jamais pour paraphraser une ligne triviale.
-   - Respecter les conventions idiomatiques du langage utilisé (ex: camelCase en JS, snake_case en Python).
-
-3. Gestion des erreurs
-   - Toujours prévoir le cas d'échec (try/catch, vérification de valeurs nulles, réponses API en erreur).
-   - Ne jamais avaler une erreur silencieusement sans au moins la logger.
-
-4. Honnêteté technique
-   - Si une bibliothèque ou une API a pu changer depuis ta dernière connaissance certaine, le dire clairement plutôt que d'inventer une syntaxe.
-   - Si la demande est ambiguë ou risque de casser quelque chose d'existant, poser une question précise avant de sortir du code, plutôt que de deviner.
-   - Ne jamais prétendre qu'un code a été testé s'il ne l'a pas été.
-
-5. Complet mais concis
-   - Donner du code copiable-collable directement fonctionnel, pas des fragments trop elliptiques.
-   - Expliquer en 1-3 phrases le raisonnement clé après le code, pas un roman.
-   - Si le fix touche plusieurs fichiers, dire clairement lesquels et pourquoi.
-
-Ton style reste chaleureux et direct, mais tes réponses techniques doivent être celles d'un développeur senior qui pense sécurité, lisibilité et robustesse avant tout.`,
+Ton style reste chaleureux et direct, mais tes réponses techniques sont celles d'un développeur senior qui pense sécurité, lisibilité et robustesse avant tout.`,
   },
 };
 const SYSTEM_PROMPT = SYSTEM_PROMPTS.normal;
@@ -72,8 +54,10 @@ const MENU_TEXT =
   "🆔  id — ton identifiant Messenger\n" +
   "🔎  recherche <question> — recherche web en temps réel\n" +
   "🎨  dessine-moi <description> — générer une image\n" +
-  "🧑‍💻  mode codeur — bascule en assistant technique (bonnes pratiques intégrées)\n" +
+  "🧑‍💻  mode codeur — bascule en assistant technique\n" +
   "💬  mode normal — retour au mode discussion classique\n\n" +
+  "📄  fichier html|css|js <description> — générer un fichier de code\n" +
+  "🗜️  zip <description> — mini site (html+css+js) zippé\n\n" +
   "✒️ police liste — voir tous les styles disponibles\n" +
   "✒️ police <style> <texte> — styliser un texte\n" +
   "🌍  traduis <langue> <texte> — traduction instantanée\n" +
@@ -92,49 +76,41 @@ const DIG = "0123456789".split("");
 
 const FONT_STYLES = {
   gras: {
-    label: "Gras",
     upper: "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙".split(""),
     lower: "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳".split(""),
     digits: "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗".split(""),
   },
   italique: {
-    label: "Italique",
     upper: "𝐴𝐵𝐶𝐷𝐸𝐹𝐺𝐻𝐼𝐽𝐾𝐿𝑀𝑁𝑂𝑃𝑄𝑅𝑆𝑇𝑈𝑉𝑊𝑋𝑌𝑍".split(""),
     lower: "𝑎𝑏𝑐𝑑𝑒𝑓𝑔ℎ𝑖𝑗𝑘𝑙𝑚𝑛𝑜𝑝𝑞𝑟𝑠𝑡𝑢𝑣𝑤𝑥𝑦𝑧".split(""),
     digits: null,
   },
   "gras-italique": {
-    label: "Gras Italique",
     upper: "𝑨𝑩𝑪𝑫𝑬𝑭𝑮𝑯𝑰𝑱𝑲𝑳𝑴𝑵𝑶𝑷𝑸𝑹𝑺𝑻𝑼𝑽𝑾𝑿𝒀𝒁".split(""),
     lower: "𝒂𝒃𝒄𝒅𝒆𝒇𝒈𝒉𝒊𝒋𝒌𝒍𝒎𝒏𝒐𝒑𝒒𝒓𝒔𝒕𝒖𝒗𝒘𝒙𝒚𝒛".split(""),
     digits: null,
   },
   script: {
-    label: "Script",
     upper: "𝒜ℬ𝒞𝒟ℰℱ𝒢ℋℐ𝒥𝒦ℒℳ𝒩𝒪𝒫𝒬ℛ𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵".split(""),
     lower: "𝒶𝒷𝒸𝒹ℯ𝒻ℊ𝒽𝒾𝒿𝓀𝓁𝓂𝓃ℴ𝓅𝓆𝓇𝓈𝓉𝓊𝓋𝓌𝓍𝓎𝓏".split(""),
     digits: null,
   },
   double: {
-    label: "Double (𝔻𝕠𝕦𝕓𝕝𝕖)",
     upper: "𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ".split(""),
     lower: "𝕒𝕓𝕔𝕕𝕖𝕗𝕘𝕙𝕚𝕛𝕜𝕝𝕞𝕟𝕠𝕡𝕢𝕣𝕤𝕥𝕦𝕧𝕨𝕩𝕪𝕫".split(""),
     digits: "𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡".split(""),
   },
   gothique: {
-    label: "Gothique",
     upper: "𝔄𝔅ℭ𝔇𝔈𝔉𝔊ℌℑ𝔍𝔎𝔏𝔐𝔑𝔒𝔓𝔔ℜ𝔖𝔗𝔘𝔙𝔚𝔛𝔜ℨ".split(""),
     lower: "𝔞𝔟𝔠𝔡𝔢𝔣𝔤𝔥𝔦𝔧𝔨𝔩𝔪𝔫𝔬𝔭𝔮𝔯𝔰𝔱𝔲𝔳𝔴𝔵𝔶𝔷".split(""),
     digits: null,
   },
   mono: {
-    label: "Mono",
     upper: "𝙰𝙱𝙲𝙳𝙴𝙵𝙶𝙷𝙸𝙹𝙺𝙻𝙼𝙽𝙾𝙿𝚀𝚁𝚂𝚃𝚄𝚅𝚆𝚇𝚈𝚉".split(""),
     lower: "𝚊𝚋𝚌𝚍𝚎𝚏𝚐𝚑𝚒𝚓𝚔𝚕𝚖𝚗𝚘𝚙𝚚𝚛𝚜𝚝𝚞𝚟𝚠𝚡𝚢𝚣".split(""),
     digits: "𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿".split(""),
   },
   bulle: {
-    label: "Bulle",
     upper: "ⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ".split(""),
     lower: "ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩ".split(""),
     digits: "⓪①②③④⑤⑥⑦⑧⑨".split(""),
@@ -159,8 +135,8 @@ function styleText(text, styleKey) {
 }
 
 function stylesListText() {
-  const examples = Object.entries(FONT_STYLES)
-    .map(([key, s]) => `• ${key} → ${styleText("Adefal", key)}`)
+  const examples = Object.keys(FONT_STYLES)
+    .map((key) => `• ${key} → ${styleText("Adefal", key)}`)
     .join("\n");
   return `✒️ Styles disponibles :\n\n${examples}\n\n➡️ Exemple : "police gras salut tout le monde"`;
 }
@@ -288,6 +264,12 @@ function parseCommand(text) {
   const meteoMatch = text.trim().match(/^meteo\s+(.+)$/i) || text.trim().match(/^météo\s+(.+)$/i);
   if (meteoMatch) return { type: "meteo", ville: meteoMatch[1].trim() };
 
+  const fichierMatch = text.trim().match(/^fichier\s+(html|css|js)\s+(.+)$/i);
+  if (fichierMatch) return { type: "fichier", lang: fichierMatch[1].toLowerCase(), description: fichierMatch[2].trim() };
+
+  const zipMatch = text.trim().match(/^zip\s+(.+)$/i);
+  if (zipMatch) return { type: "zip", description: zipMatch[1].trim() };
+
   return null;
 }
 
@@ -309,10 +291,7 @@ async function handleCommand(senderId, command) {
       case "mode_coder":
         userModes[senderId] = "coder";
         if (conversations[senderId]) conversations[senderId][0] = SYSTEM_PROMPTS.coder;
-        await sendMessage(
-          senderId,
-          "🧑‍💻 Mode Codeur activé — je vais coder proprement : sécurité, lisibilité, gestion d'erreurs. Écris 'mode normal' pour revenir."
-        );
+        await sendMessage(senderId, "🧑‍💻 Mode Codeur activé. Écris 'mode normal' pour revenir.");
         break;
 
       case "mode_normal":
@@ -386,11 +365,113 @@ async function handleCommand(senderId, command) {
         await sendMessage(senderId, `☀️ ${meteo}`);
         break;
       }
+
+      case "fichier": {
+        await sendTypingIndicator(senderId, "typing_on");
+        try {
+          const code = await generateSingleFileCode(command.lang, command.description);
+          const mime = { html: "text/html", css: "text/css", js: "application/javascript" }[command.lang];
+          await sendFileAttachment(senderId, `fichier.${command.lang}`, code, mime);
+        } finally {
+          await sendTypingIndicator(senderId, "typing_off");
+        }
+        break;
+      }
+
+      case "zip": {
+        await sendTypingIndicator(senderId, "typing_on");
+        try {
+          const files = await generateMiniSite(command.description);
+          const zipBuffer = await createZip({
+            "index.html": files.html,
+            "style.css": files.css,
+            "script.js": files.js,
+          });
+          await sendFileAttachment(senderId, "projet.zip", zipBuffer, "application/zip");
+        } finally {
+          await sendTypingIndicator(senderId, "typing_off");
+        }
+        break;
+      }
     }
   } catch (err) {
     console.error("Erreur handleCommand:", err.message);
     await sendMessage(senderId, "Désolé, une erreur est survenue avec cette commande 🙏");
   }
+}
+
+// ==== Génération de code et export de fichiers ====
+function stripMarkdownFences(text) {
+  return text.replace(/^```[a-zA-Z]*\n?/, "").replace(/```\s*$/, "").trim();
+}
+
+async function generateSingleFileCode(language, description) {
+  const prompts = {
+    html: "Tu génères uniquement du code HTML valide et autonome (balises html/head/body incluses) pour la demande. Réponds uniquement avec le code, sans markdown, sans explication.",
+    css: "Tu génères uniquement du code CSS pour la demande. Réponds uniquement avec le code, sans markdown, sans explication.",
+    js: "Tu génères uniquement du code JavaScript pour la demande. Réponds uniquement avec le code, sans markdown, sans explication.",
+  };
+  const messages = [
+    { role: "system", content: prompts[language] },
+    { role: "user", content: description },
+  ];
+  const code = await callGroqWithFallback(messages, 0.7);
+  return stripMarkdownFences(code);
+}
+
+async function generateMiniSite(description) {
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Tu génères un mini site web complet et cohérent (HTML + CSS + JS qui fonctionnent ensemble) pour la demande de l'utilisateur. Réponds EXACTEMENT sous cette forme, sans rien ajouter avant ni après, sans markdown :\n" +
+        "===HTML===\n<code html ici>\n===CSS===\n<code css ici>\n===JS===\n<code js ici>",
+    },
+    { role: "user", content: description },
+  ];
+  const raw = await callGroqWithFallback(messages, 0.7);
+
+  const htmlMatch = raw.match(/===HTML===([\s\S]*?)===CSS===/);
+  const cssMatch = raw.match(/===CSS===([\s\S]*?)===JS===/);
+  const jsMatch = raw.match(/===JS===([\s\S]*)$/);
+
+  if (!htmlMatch || !cssMatch || !jsMatch) {
+    throw new Error("Format de génération inattendu depuis Groq.");
+  }
+
+  return {
+    html: stripMarkdownFences(htmlMatch[1]),
+    css: stripMarkdownFences(cssMatch[1]),
+    js: stripMarkdownFences(jsMatch[1]),
+  };
+}
+
+async function createZip(files) {
+  const zip = new JSZip();
+  for (const [name, content] of Object.entries(files)) {
+    zip.file(name, content);
+  }
+  return await zip.generateAsync({ type: "nodebuffer" });
+}
+
+// Envoi d'un fichier (texte ou binaire) via upload direct Messenger (sans hébergement externe)
+async function sendFileAttachment(recipientId, filename, content, mimeType) {
+  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PAGE_ID}/messages?access_token=${PAGE_ACCESS_TOKEN}`;
+
+  const form = new FormData();
+  form.append("recipient", JSON.stringify({ id: recipientId }));
+  form.append("messaging_type", "RESPONSE");
+  form.append("message", JSON.stringify({ attachment: { type: "file", payload: {} } }));
+  const blob = new Blob([content], { type: mimeType });
+  form.append("filedata", blob, filename);
+
+  const res = await fetch(url, { method: "POST", body: form });
+  const data = await res.json();
+  if (!res.ok) {
+    console.error("Erreur sendFileAttachment:", JSON.stringify(data));
+    throw new Error(`Envoi du fichier échoué: ${JSON.stringify(data)}`);
+  }
+  return data;
 }
 
 async function translateText(text, langue) {
@@ -504,7 +585,7 @@ async function callGroq(messages, model, temperature = 0.8) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, temperature, max_tokens: 500 }),
+    body: JSON.stringify({ model, messages, temperature, max_tokens: 1500 }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(`Groq error (${model}): ${JSON.stringify(data)}`);
