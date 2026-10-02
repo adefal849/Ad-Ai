@@ -3,9 +3,15 @@
 //
 // Historique des correctifs :
 // - 13/07/2026 : endpoint Send API /{PAGE_ID}/messages + messaging_type obligatoire.
-// - 29/09/2026 : modèles texte/vision dépréciés remplacés par des listes de secours
-//   + commandes fun (police, traducteur, blagues, météo) + Mode Codeur enrichi
-//   + génération et envoi de fichiers HTML/CSS/JS et export ZIP (jszip).
+// - 29/09/2026 : modèles dépréciés remplacés par des listes de secours + commandes
+//   fun (police, traducteur, blagues, météo) + Mode Codeur enrichi + génération
+//   de fichiers HTML/CSS/JS/ZIP.
+// - 02/10/2026 : 2 bugs corrigés —
+//   1) les regex de commandes (police, traduis, majuscule, leet, inverse, fichier,
+//      zip) ne capturaient pas le texte multi-lignes (flag "s" ajouté).
+//   2) Messenger refuse tout message texte de plus de 2000 caractères ; sendMessage
+//      découpe désormais automatiquement les réponses trop longues en plusieurs
+//      messages au lieu d'échouer silencieusement.
 
 const JSZip = require("jszip");
 
@@ -16,6 +22,7 @@ const PAGE_ID = process.env.PAGE_ID;
 
 const GRAPH_API_VERSION = "v25.0";
 const MAX_HISTORY = 10;
+const MESSENGER_TEXT_LIMIT = 2000;
 
 const GROQ_TEXT_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"];
 const GROQ_VISION_MODELS = ["qwen/qwen3.6-27b", "openai/gpt-oss-120b"];
@@ -59,7 +66,7 @@ const MENU_TEXT =
   "📄  fichier html|css|js <description> — générer un fichier de code\n" +
   "🗜️  zip <description> — mini site (html+css+js) zippé\n\n" +
   "✒️ police liste — voir tous les styles disponibles\n" +
-  "✒️ police <style> <texte> — styliser un texte\n" +
+  "✒️ police <style> <texte> — styliser un texte (plusieurs lignes acceptées)\n" +
   "🌍  traduis <langue> <texte> — traduction instantanée\n" +
   "😂  blague — une blague aléatoire\n" +
   "💬  citation — une citation inspirante\n" +
@@ -123,6 +130,7 @@ function styleText(text, styleKey) {
   return text
     .split("")
     .map((ch) => {
+      if (ch === "\n") return ch;
       const iUp = UP.indexOf(ch);
       if (iUp !== -1) return style.upper[iUp] || ch;
       const iLow = LOW.indexOf(ch);
@@ -138,7 +146,7 @@ function stylesListText() {
   const examples = Object.keys(FONT_STYLES)
     .map((key) => `• ${key} → ${styleText("Adefal", key)}`)
     .join("\n");
-  return `✒️ Styles disponibles :\n\n${examples}\n\n➡️ Exemple : "police gras salut tout le monde"`;
+  return `✒️ Styles disponibles :\n\n${examples}\n\n➡️ Exemple : "police gras salut tout le monde"\n(fonctionne aussi avec un texte sur plusieurs lignes)`;
 }
 
 const FLIP_MAP = {
@@ -231,8 +239,10 @@ async function handleMessage(senderId, userText) {
   }
 }
 
+// Flag "s" (dotAll) sur toutes les regex qui doivent accepter du texte multi-lignes.
 function parseCommand(text) {
-  const t = text.trim().toLowerCase();
+  const trimmed = text.trim();
+  const t = trimmed.toLowerCase();
 
   if (t === "menu" || t === "/menu") return { type: "menu" };
   if (t === "help" || t === "/help" || t === "aide") return { type: "help" };
@@ -242,32 +252,32 @@ function parseCommand(text) {
   if (t === "blague" || t === "/blague") return { type: "blague" };
   if (t === "citation" || t === "/citation") return { type: "citation" };
 
-  const searchMatch = text.trim().match(/^(?:\/recherche|recherche|\/search|search)\s+(.+)$/i);
+  const searchMatch = trimmed.match(/^(?:\/recherche|recherche|\/search|search)\s+(.+)$/is);
   if (searchMatch) return { type: "search", query: searchMatch[1].trim() };
 
   if (t === "police liste" || t === "police" || t === "/police") return { type: "police_liste" };
-  const policeMatch = text.trim().match(/^police\s+(\S+)\s+(.+)$/i);
+  const policeMatch = trimmed.match(/^police\s+(\S+)\s+(.+)$/is);
   if (policeMatch) return { type: "police", style: policeMatch[1].toLowerCase(), text: policeMatch[2] };
 
-  const traduisMatch = text.trim().match(/^traduis\s+(?:en\s+)?(\S+)\s+(.+)$/i);
+  const traduisMatch = trimmed.match(/^traduis\s+(?:en\s+)?(\S+)\s+(.+)$/is);
   if (traduisMatch) return { type: "traduis", langue: traduisMatch[1], text: traduisMatch[2] };
 
-  const majMatch = text.trim().match(/^majuscule\s+(.+)$/i);
+  const majMatch = trimmed.match(/^majuscule\s+(.+)$/is);
   if (majMatch) return { type: "majuscule", text: majMatch[1] };
 
-  const leetMatch = text.trim().match(/^leet\s+(.+)$/i);
+  const leetMatch = trimmed.match(/^leet\s+(.+)$/is);
   if (leetMatch) return { type: "leet", text: leetMatch[1] };
 
-  const inverseMatch = text.trim().match(/^inverse\s+(.+)$/i);
+  const inverseMatch = trimmed.match(/^inverse\s+(.+)$/is);
   if (inverseMatch) return { type: "inverse", text: inverseMatch[1] };
 
-  const meteoMatch = text.trim().match(/^meteo\s+(.+)$/i) || text.trim().match(/^météo\s+(.+)$/i);
+  const meteoMatch = trimmed.match(/^(?:meteo|météo)\s+(.+)$/is);
   if (meteoMatch) return { type: "meteo", ville: meteoMatch[1].trim() };
 
-  const fichierMatch = text.trim().match(/^fichier\s+(html|css|js)\s+(.+)$/i);
+  const fichierMatch = trimmed.match(/^fichier\s+(html|css|js)\s+(.+)$/is);
   if (fichierMatch) return { type: "fichier", lang: fichierMatch[1].toLowerCase(), description: fichierMatch[2].trim() };
 
-  const zipMatch = text.trim().match(/^zip\s+(.+)$/i);
+  const zipMatch = trimmed.match(/^zip\s+(.+)$/is);
   if (zipMatch) return { type: "zip", description: zipMatch[1].trim() };
 
   return null;
@@ -400,7 +410,6 @@ async function handleCommand(senderId, command) {
   }
 }
 
-// ==== Génération de code et export de fichiers ====
 function stripMarkdownFences(text) {
   return text.replace(/^```[a-zA-Z]*\n?/, "").replace(/```\s*$/, "").trim();
 }
@@ -454,7 +463,6 @@ async function createZip(files) {
   return await zip.generateAsync({ type: "nodebuffer" });
 }
 
-// Envoi d'un fichier (texte ou binaire) via upload direct Messenger (sans hébergement externe)
 async function sendFileAttachment(recipientId, filename, content, mimeType) {
   const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PAGE_ID}/messages?access_token=${PAGE_ACCESS_TOKEN}`;
 
@@ -655,16 +663,44 @@ async function callGroqVision(imageUrl, systemPrompt, model) {
   return data.choices[0].message.content;
 }
 
+// Découpe un texte trop long en morceaux <= MESSENGER_TEXT_LIMIT, en coupant
+// de préférence sur un saut de ligne ou un espace plutôt qu'en plein milieu d'un mot.
+function splitForMessenger(text) {
+  if (text.length <= MESSENGER_TEXT_LIMIT) return [text];
+
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > MESSENGER_TEXT_LIMIT) {
+    let cut = remaining.lastIndexOf("\n", MESSENGER_TEXT_LIMIT);
+    if (cut < MESSENGER_TEXT_LIMIT * 0.5) {
+      cut = remaining.lastIndexOf(" ", MESSENGER_TEXT_LIMIT);
+    }
+    if (cut < MESSENGER_TEXT_LIMIT * 0.5) {
+      cut = MESSENGER_TEXT_LIMIT;
+    }
+    chunks.push(remaining.slice(0, cut).trim());
+    remaining = remaining.slice(cut).trim();
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
+}
+
 async function sendMessage(recipientId, text) {
-  const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PAGE_ID}/messages?access_token=${PAGE_ACCESS_TOKEN}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messaging_type: "RESPONSE", recipient: { id: recipientId }, message: { text } }),
-  });
-  const data = await res.json();
-  if (!res.ok) console.error("Erreur sendMessage:", JSON.stringify(data));
-  return data;
+  const chunks = splitForMessenger(text);
+  let lastData;
+  for (const chunk of chunks) {
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PAGE_ID}/messages?access_token=${PAGE_ACCESS_TOKEN}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messaging_type: "RESPONSE", recipient: { id: recipientId }, message: { text: chunk } }),
+    });
+    const data = await res.json();
+    if (!res.ok) console.error("Erreur sendMessage:", JSON.stringify(data));
+    lastData = data;
+  }
+  return lastData;
 }
 
 async function sendTypingIndicator(recipientId, action) {
