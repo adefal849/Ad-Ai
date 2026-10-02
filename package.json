@@ -2,7 +2,9 @@
   "name": "adefal-messenger-bot-netlify",
   "version": "1.0.0",
   "description": "Chatbot Messenger IA pour page Facebook, propulsé par Groq, déployé sur Netlify Functions",
-  "dependencies": {},
+  "dependencies": {
+    "jszip": "^3.10.1"
+  },
   "engines": {
     "node": ">=18.0.0"
   }
