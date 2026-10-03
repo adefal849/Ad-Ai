@@ -3,15 +3,21 @@
 //
 // Historique des correctifs :
 // - 13/07/2026 : endpoint Send API /{PAGE_ID}/messages + messaging_type obligatoire.
-// - 29/09/2026 : modèles dépréciés remplacés par des listes de secours + commandes
-//   fun (police, traducteur, blagues, météo) + Mode Codeur enrichi + génération
-//   de fichiers HTML/CSS/JS/ZIP.
-// - 02/10/2026 : 2 bugs corrigés —
-//   1) les regex de commandes (police, traduis, majuscule, leet, inverse, fichier,
-//      zip) ne capturaient pas le texte multi-lignes (flag "s" ajouté).
-//   2) Messenger refuse tout message texte de plus de 2000 caractères ; sendMessage
-//      découpe désormais automatiquement les réponses trop longues en plusieurs
-//      messages au lieu d'échouer silencieusement.
+// - 29/09/2026 : modèles dépréciés remplacés + commandes fun + Mode Codeur enrichi
+//   + génération de fichiers HTML/CSS/JS/ZIP.
+// - 02/10/2026 (1) : regex multi-lignes + découpage auto des messages > 2000 car.
+// - 02/10/2026 (2) : CORRECTIF MAJEUR — les styles de police Unicode (gras,
+//   italique, script, double, gothique, mono) utilisent des caractères du plan
+//   Unicode supplémentaire (au-delà de U+FFFF), représentés en JS par des paires
+//   de substituts (surrogate pairs). String.split("") découpe par unité UTF-16 et
+//   NON par caractère réel, donc il cassait ces paires en morceaux invalides →
+//   texte illisible du type "111&&#(!#;€929+2-2". Remplacé par Array.from(), qui
+//   découpe par point de code Unicode correctement.
+//   + openai/gpt-oss-120b n'est PAS un modèle vision (corrigé la liste de secours).
+//   + suivi de question sur une image déjà envoyée (mémoire d'image courte durée).
+//   + recherche web avec repli si l'outil échoue.
+//   + anti-hallucination d'identité (pas de fausse vie privée inventée).
+//   + nouvelles commandes : calcul, definition, resume.
 
 const JSZip = require("jszip");
 
@@ -25,13 +31,15 @@ const MAX_HISTORY = 10;
 const MESSENGER_TEXT_LIMIT = 2000;
 
 const GROQ_TEXT_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"];
-const GROQ_VISION_MODELS = ["qwen/qwen3.6-27b", "openai/gpt-oss-120b"];
+// openai/gpt-oss-120b n'a PAS de capacité vision : seuls les modèles Qwen ci-dessous l'ont.
+const GROQ_VISION_MODELS = ["qwen/qwen3.6-27b", "qwen/qwen3.8-27b"];
 
 const SYSTEM_PROMPTS = {
   normal: {
     role: "system",
     content:
-      "Tu es Adéfal AI, un assistant conversationnel sympathique et naturel, qui discute librement avec les utilisateurs sur Messenger. Réponds en français par défaut, de façon chaleureuse et concise.",
+      "Tu es Adéfal AI, un assistant conversationnel sympathique et naturel, qui discute librement avec les utilisateurs sur Messenger. Réponds en français par défaut, de façon chaleureuse et concise. " +
+      "Tu es une IA : tu n'as pas de vie privée réelle (pas de conjoint, pas de famille, pas de corps). Si on te pose ce genre de question, réponds avec humour en clarifiant que tu es une IA, mais n'invente JAMAIS de fausse information personnelle présentée comme un fait réel (pas de faux nom de conjoint(e), d'enfants, etc.).",
   },
   coder: {
     role: "system",
@@ -44,6 +52,13 @@ Règles de bonnes pratiques que tu appliques systématiquement :
 4. Honnêteté technique — signaler si une API a pu changer, poser une question plutôt que deviner en cas d'ambiguïté.
 5. Concis mais complet — du code copiable-collable directement fonctionnel.
 
+Quelques réflexes supplémentaires de développeur senior ("secrets" de métier) :
+- Débogage méthodique : d'abord reproduire le bug de façon fiable, ensuite isoler la variable en cause (bissection), et lire le message d'erreur EN ENTIER avant de chercher ailleurs — la réponse y est souvent déjà.
+- Ne jamais optimiser avant d'avoir mesuré (la majorité des optimisations prématurées ciblent le mauvais endroit).
+- Un commit = un changement logique, avec un message qui explique le "pourquoi", pas juste le "quoi".
+- Toujours garder un chemin de retour arrière (rollback) avant de déployer un changement risqué en prod.
+- Se méfier du code qu'on n'a pas testé soi-même, même généré par une IA — y compris le tien.
+
 Ton style reste chaleureux et direct, mais tes réponses techniques sont celles d'un développeur senior qui pense sécurité, lisibilité et robustesse avant tout.`,
   },
 };
@@ -51,29 +66,33 @@ const SYSTEM_PROMPT = SYSTEM_PROMPTS.normal;
 
 const conversations = {};
 const userModes = {};
+const lastImageUrl = {}; // senderId -> URL de la dernière photo envoyée (pour les questions de suivi)
 
 const MENU_TEXT =
   "━━━━━━━━━━━━━━━━━━━━\n" +
   "✨  F E M I   A I  ✨\n" +
   "━━━━━━━━━━━━━━━━━━━━\n\n" +
-  "📜 Menu principal\n\n" +
-  "🆘  help — afficher cette aide\n" +
-  "🆔  id — ton identifiant Messenger\n" +
-  "🔎  recherche <question> — recherche web en temps réel\n" +
-  "🎨  dessine-moi <description> — générer une image\n" +
-  "🧑‍💻  mode codeur — bascule en assistant technique\n" +
-  "💬  mode normal — retour au mode discussion classique\n\n" +
-  "📄  fichier html|css|js <description> — générer un fichier de code\n" +
-  "🗜️  zip <description> — mini site (html+css+js) zippé\n\n" +
-  "✒️ police liste — voir tous les styles disponibles\n" +
-  "✒️ police <style> <texte> — styliser un texte (plusieurs lignes acceptées)\n" +
-  "🌍  traduis <langue> <texte> — traduction instantanée\n" +
-  "😂  blague — une blague aléatoire\n" +
-  "💬  citation — une citation inspirante\n" +
-  "🔠  majuscule <texte> — tout en MAJUSCULES\n" +
-  "🕶️  leet <texte> — convertir en l33t sp34k\n" +
-  "🔄  inverse <texte> — inverser le texte\n" +
-  "☀️  meteo <ville> — météo actuelle d'une ville\n\n" +
+  "💬 DISCUSSION\n" +
+  "🆘 help — cette aide\n" +
+  "🆔 id — ton identifiant Messenger\n" +
+  "🔎 recherche <question> — recherche web en temps réel\n" +
+  "🧑‍💻 mode codeur / 💬 mode normal — changer de mode\n\n" +
+  "🎨 CRÉATION\n" +
+  "🖼️ dessine-moi <description> — générer une image\n" +
+  "📄 fichier html|css|js <description> — un fichier de code\n" +
+  "🗜️ zip <description> — mini site (html+css+js) zippé\n\n" +
+  "🧰 OUTILS\n" +
+  "🧮 calcul <expression> — calculatrice\n" +
+  "📖 definition <mot> — définition d'un mot\n" +
+  "✂️ resume <texte> — résumer un texte\n" +
+  "🌍 traduis <langue> <texte> — traduction\n" +
+  "☀️ meteo <ville> — météo actuelle\n\n" +
+  "🎉 FUN\n" +
+  "✒️ police liste — voir tous les styles\n" +
+  "✒️ police <style> <texte> — styliser un texte\n" +
+  "😂 blague — une blague aléatoire\n" +
+  "💬 citation — une citation inspirante\n" +
+  "🔠 majuscule / 🕶️ leet / 🔄 inverse <texte>\n\n" +
   "━━━━━━━━━━━━━━━━━━━━\n" +
   "Écris-moi normalement pour discuter, je suis là 🙂";
 
@@ -81,54 +100,56 @@ const UP = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 const LOW = "abcdefghijklmnopqrstuvwxyz".split("");
 const DIG = "0123456789".split("");
 
+// IMPORTANT : Array.from() et non .split("") — plusieurs de ces styles utilisent
+// des caractères Unicode hors du plan de base (paires de substituts). split("")
+// casserait ces caractères en morceaux invalides.
 const FONT_STYLES = {
   gras: {
-    upper: "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙".split(""),
-    lower: "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳".split(""),
-    digits: "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗".split(""),
+    upper: Array.from("𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"),
+    lower: Array.from("𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳"),
+    digits: Array.from("𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"),
   },
   italique: {
-    upper: "𝐴𝐵𝐶𝐷𝐸𝐹𝐺𝐻𝐼𝐽𝐾𝐿𝑀𝑁𝑂𝑃𝑄𝑅𝑆𝑇𝑈𝑉𝑊𝑋𝑌𝑍".split(""),
-    lower: "𝑎𝑏𝑐𝑑𝑒𝑓𝑔ℎ𝑖𝑗𝑘𝑙𝑚𝑛𝑜𝑝𝑞𝑟𝑠𝑡𝑢𝑣𝑤𝑥𝑦𝑧".split(""),
+    upper: Array.from("𝐴𝐵𝐶𝐷𝐸𝐹𝐺𝐻𝐼𝐽𝐾𝐿𝑀𝑁𝑂𝑃𝑄𝑅𝑆𝑇𝑈𝑉𝑊𝑋𝑌𝑍"),
+    lower: Array.from("𝑎𝑏𝑐𝑑𝑒𝑓𝑔ℎ𝑖𝑗𝑘𝑙𝑚𝑛𝑜𝑝𝑞𝑟𝑠𝑡𝑢𝑣𝑤𝑥𝑦𝑧"),
     digits: null,
   },
   "gras-italique": {
-    upper: "𝑨𝑩𝑪𝑫𝑬𝑭𝑮𝑯𝑰𝑱𝑲𝑳𝑴𝑵𝑶𝑷𝑸𝑹𝑺𝑻𝑼𝑽𝑾𝑿𝒀𝒁".split(""),
-    lower: "𝒂𝒃𝒄𝒅𝒆𝒇𝒈𝒉𝒊𝒋𝒌𝒍𝒎𝒏𝒐𝒑𝒒𝒓𝒔𝒕𝒖𝒗𝒘𝒙𝒚𝒛".split(""),
+    upper: Array.from("𝑨𝑩𝑪𝑫𝑬𝑭𝑮𝑯𝑰𝑱𝑲𝑳𝑴𝑵𝑶𝑷𝑸𝑹𝑺𝑻𝑼𝑽𝑾𝑿𝒀𝒁"),
+    lower: Array.from("𝒂𝒃𝒄𝒅𝒆𝒇𝒈𝒉𝒊𝒋𝒌𝒍𝒎𝒏𝒐𝒑𝒒𝒓𝒔𝒕𝒖𝒗𝒘𝒙𝒚𝒛"),
     digits: null,
   },
   script: {
-    upper: "𝒜ℬ𝒞𝒟ℰℱ𝒢ℋℐ𝒥𝒦ℒℳ𝒩𝒪𝒫𝒬ℛ𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵".split(""),
-    lower: "𝒶𝒷𝒸𝒹ℯ𝒻ℊ𝒽𝒾𝒿𝓀𝓁𝓂𝓃ℴ𝓅𝓆𝓇𝓈𝓉𝓊𝓋𝓌𝓍𝓎𝓏".split(""),
+    upper: Array.from("𝒜ℬ𝒞𝒟ℰℱ𝒢ℋℐ𝒥𝒦ℒℳ𝒩𝒪𝒫𝒬ℛ𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵"),
+    lower: Array.from("𝒶𝒷𝒸𝒹ℯ𝒻ℊ𝒽𝒾𝒿𝓀𝓁𝓂𝓃ℴ𝓅𝓆𝓇𝓈𝓉𝓊𝓋𝓌𝓍𝓎𝓏"),
     digits: null,
   },
   double: {
-    upper: "𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ".split(""),
-    lower: "𝕒𝕓𝕔𝕕𝕖𝕗𝕘𝕙𝕚𝕛𝕜𝕝𝕞𝕟𝕠𝕡𝕢𝕣𝕤𝕥𝕦𝕧𝕨𝕩𝕪𝕫".split(""),
-    digits: "𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡".split(""),
+    upper: Array.from("𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ"),
+    lower: Array.from("𝕒𝕓𝕔𝕕𝕖𝕗𝕘𝕙𝕚𝕛𝕜𝕝𝕞𝕟𝕠𝕡𝕢𝕣𝕤𝕥𝕦𝕧𝕨𝕩𝕪𝕫"),
+    digits: Array.from("𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡"),
   },
   gothique: {
-    upper: "𝔄𝔅ℭ𝔇𝔈𝔉𝔊ℌℑ𝔍𝔎𝔏𝔐𝔑𝔒𝔓𝔔ℜ𝔖𝔗𝔘𝔙𝔚𝔛𝔜ℨ".split(""),
-    lower: "𝔞𝔟𝔠𝔡𝔢𝔣𝔤𝔥𝔦𝔧𝔨𝔩𝔪𝔫𝔬𝔭𝔮𝔯𝔰𝔱𝔲𝔳𝔴𝔵𝔶𝔷".split(""),
+    upper: Array.from("𝔄𝔅ℭ𝔇𝔈𝔉𝔊ℌℑ𝔍𝔎𝔏𝔐𝔑𝔒𝔓𝔔ℜ𝔖𝔗𝔘𝔙𝔚𝔛𝔜ℨ"),
+    lower: Array.from("𝔞𝔟𝔠𝔡𝔢𝔣𝔤𝔥𝔦𝔧𝔨𝔩𝔪𝔫𝔬𝔭𝔮𝔯𝔰𝔱𝔲𝔳𝔴𝔵𝔶𝔷"),
     digits: null,
   },
   mono: {
-    upper: "𝙰𝙱𝙲𝙳𝙴𝙵𝙶𝙷𝙸𝙹𝙺𝙻𝙼𝙽𝙾𝙿𝚀𝚁𝚂𝚃𝚄𝚅𝚆𝚇𝚈𝚉".split(""),
-    lower: "𝚊𝚋𝚌𝚍𝚎𝚏𝚐𝚑𝚒𝚓𝚔𝚕𝚖𝚗𝚘𝚙𝚚𝚛𝚜𝚝𝚞𝚟𝚠𝚡𝚢𝚣".split(""),
-    digits: "𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿".split(""),
+    upper: Array.from("𝙰𝙱𝙲𝙳𝙴𝙵𝙶𝙷𝙸𝙹𝙺𝙻𝙼𝙽𝙾𝙿𝚀𝚁𝚂𝚃𝚄𝚅𝚆𝚇𝚈𝚉"),
+    lower: Array.from("𝚊𝚋𝚌𝚍𝚎𝚏𝚐𝚑𝚒𝚓𝚔𝚕𝚖𝚗𝚘𝚙𝚚𝚛𝚜𝚝𝚞𝚟𝚠𝚡𝚢𝚣"),
+    digits: Array.from("𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿"),
   },
   bulle: {
-    upper: "ⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ".split(""),
-    lower: "ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩ".split(""),
-    digits: "⓪①②③④⑤⑥⑦⑧⑨".split(""),
+    upper: Array.from("ⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ"),
+    lower: Array.from("ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩ"),
+    digits: Array.from("⓪①②③④⑤⑥⑦⑧⑨"),
   },
 };
 
 function styleText(text, styleKey) {
   const style = FONT_STYLES[styleKey];
   if (!style) return null;
-  return text
-    .split("")
+  return Array.from(text)
     .map((ch) => {
       if (ch === "\n") return ch;
       const iUp = UP.indexOf(ch);
@@ -161,12 +182,61 @@ const FLIP_MAP = {
   "'": ",", "(": ")", ")": "(", "[": "]", "]": "[",
 };
 function flipText(text) {
-  return text.split("").reverse().map((ch) => FLIP_MAP[ch] || ch).join("");
+  return Array.from(text).reverse().map((ch) => FLIP_MAP[ch] || ch).join("");
 }
 
 const LEET_MAP = { a: "4", e: "3", i: "1", o: "0", s: "5", t: "7", A: "4", E: "3", I: "1", O: "0", S: "5", T: "7" };
 function leetText(text) {
-  return text.split("").map((ch) => LEET_MAP[ch] || ch).join("");
+  return Array.from(text).map((ch) => LEET_MAP[ch] || ch).join("");
+}
+
+// ==== Calculatrice sécurisée (sans eval/Function) ====
+function safeCalculate(expr) {
+  const tokens = expr.match(/\d+(\.\d+)?|\+|-|\*|\/|\(|\)/g);
+  if (!tokens) throw new Error("Expression invalide");
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const consume = () => tokens[pos++];
+
+  function parseExpr() {
+    let val = parseTerm();
+    while (peek() === "+" || peek() === "-") {
+      const op = consume();
+      const rhs = parseTerm();
+      val = op === "+" ? val + rhs : val - rhs;
+    }
+    return val;
+  }
+  function parseTerm() {
+    let val = parseFactor();
+    while (peek() === "*" || peek() === "/") {
+      const op = consume();
+      const rhs = parseFactor();
+      val = op === "*" ? val * rhs : val / rhs;
+    }
+    return val;
+  }
+  function parseFactor() {
+    if (peek() === "(") {
+      consume();
+      const val = parseExpr();
+      if (peek() !== ")") throw new Error("Parenthèse manquante");
+      consume();
+      return val;
+    }
+    if (peek() === "-") {
+      consume();
+      return -parseFactor();
+    }
+    const token = consume();
+    const num = parseFloat(token);
+    if (token === undefined || isNaN(num)) throw new Error("Nombre invalide");
+    return num;
+  }
+
+  const result = parseExpr();
+  if (pos !== tokens.length) throw new Error("Expression invalide");
+  return result;
 }
 
 exports.handler = async (event) => {
@@ -220,6 +290,22 @@ async function handleMessage(senderId, userText) {
     const mode = userModes[senderId] || "normal";
     const systemPrompt = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.normal;
 
+    // Si une photo vient d'être envoyée, on considère ce message comme une
+    // question de suivi dessus (une seule fois, puis on efface le contexte image).
+    if (lastImageUrl[senderId]) {
+      const imageUrl = lastImageUrl[senderId];
+      delete lastImageUrl[senderId];
+      const aiReply = await callGroqVisionWithFallback(imageUrl, systemPrompt, userText);
+
+      if (!conversations[senderId]) conversations[senderId] = [systemPrompt];
+      conversations[senderId].push({ role: "user", content: userText });
+      conversations[senderId].push({ role: "assistant", content: aiReply });
+
+      await sendTypingIndicator(senderId, "typing_off");
+      await sendMessage(senderId, aiReply);
+      return;
+    }
+
     if (!conversations[senderId]) conversations[senderId] = [systemPrompt];
     else conversations[senderId][0] = systemPrompt;
 
@@ -239,7 +325,6 @@ async function handleMessage(senderId, userText) {
   }
 }
 
-// Flag "s" (dotAll) sur toutes les regex qui doivent accepter du texte multi-lignes.
 function parseCommand(text) {
   const trimmed = text.trim();
   const t = trimmed.toLowerCase();
@@ -280,6 +365,15 @@ function parseCommand(text) {
   const zipMatch = trimmed.match(/^zip\s+(.+)$/is);
   if (zipMatch) return { type: "zip", description: zipMatch[1].trim() };
 
+  const calculMatch = trimmed.match(/^calcul\s+(.+)$/is);
+  if (calculMatch) return { type: "calcul", expr: calculMatch[1].trim() };
+
+  const definitionMatch = trimmed.match(/^d[ée]finition\s+(.+)$/is);
+  if (definitionMatch) return { type: "definition", mot: definitionMatch[1].trim() };
+
+  const resumeMatch = trimmed.match(/^r[ée]sume\s+(.+)$/is);
+  if (resumeMatch) return { type: "resume", text: resumeMatch[1] };
+
   return null;
 }
 
@@ -312,9 +406,20 @@ async function handleCommand(senderId, command) {
 
       case "search": {
         await sendTypingIndicator(senderId, "typing_on");
-        const result = await callGroqCompoundSearch(command.query);
+        let result;
+        try {
+          result = await callGroqCompoundSearch(command.query);
+          result = `🔎 ${result}`;
+        } catch (err) {
+          console.error("Recherche web indisponible, repli sur réponse générale:", err.message);
+          const fallback = await callGroqWithFallback([
+            { role: "system", content: "Réponds en français, de façon concise, à partir de tes connaissances générales." },
+            { role: "user", content: command.query },
+          ]);
+          result = `⚠️ La recherche web en direct est momentanément indisponible, voici ce que je sais :\n\n${fallback}`;
+        }
         await sendTypingIndicator(senderId, "typing_off");
-        await sendMessage(senderId, `🔎 ${result}`);
+        await sendMessage(senderId, result);
         break;
       }
 
@@ -373,6 +478,38 @@ async function handleCommand(senderId, command) {
         const meteo = await getWeather(command.ville);
         await sendTypingIndicator(senderId, "typing_off");
         await sendMessage(senderId, `☀️ ${meteo}`);
+        break;
+      }
+
+      case "calcul": {
+        try {
+          const result = safeCalculate(command.expr);
+          await sendMessage(senderId, `🧮 ${command.expr} = ${result}`);
+        } catch (err) {
+          await sendMessage(senderId, `Expression invalide 🤔 Exemple : calcul (2+3)*4`);
+        }
+        break;
+      }
+
+      case "definition": {
+        await sendTypingIndicator(senderId, "typing_on");
+        const def = await callGroqWithFallback([
+          { role: "system", content: "Tu es un dictionnaire. Donne une définition claire et concise en français du mot donné, avec un exemple d'usage. Réponds uniquement avec la définition." },
+          { role: "user", content: command.mot },
+        ]);
+        await sendTypingIndicator(senderId, "typing_off");
+        await sendMessage(senderId, `📖 ${def}`);
+        break;
+      }
+
+      case "resume": {
+        await sendTypingIndicator(senderId, "typing_on");
+        const summary = await callGroqWithFallback([
+          { role: "system", content: "Résume le texte donné en 2-3 phrases maximum, en français, en gardant les informations essentielles." },
+          { role: "user", content: command.text },
+        ]);
+        await sendTypingIndicator(senderId, "typing_off");
+        await sendMessage(senderId, `✂️ ${summary}`);
         break;
       }
 
@@ -610,12 +747,19 @@ async function handleImageMessage(senderId, imageUrl) {
     else conversations[senderId][0] = systemPrompt;
 
     let history = conversations[senderId];
-    const aiReply = await callGroqVisionWithFallback(imageUrl, systemPrompt);
+    const aiReply = await callGroqVisionWithFallback(
+      imageUrl,
+      systemPrompt,
+      "Décris cette image et réponds de façon utile et chaleureuse."
+    );
 
     history.push({ role: "user", content: "[a envoyé une photo]" });
     history.push({ role: "assistant", content: aiReply });
     conversations[senderId] = history;
     if (history.length > MAX_HISTORY + 1) conversations[senderId] = [history[0], ...history.slice(-MAX_HISTORY)];
+
+    // On garde l'image en mémoire courte durée pour permettre une question de suivi.
+    lastImageUrl[senderId] = imageUrl;
 
     await sendTypingIndicator(senderId, "typing_off");
     await sendMessage(senderId, aiReply);
@@ -625,11 +769,11 @@ async function handleImageMessage(senderId, imageUrl) {
   }
 }
 
-async function callGroqVisionWithFallback(imageUrl, systemPrompt) {
+async function callGroqVisionWithFallback(imageUrl, systemPrompt, question) {
   let lastError;
   for (const model of GROQ_VISION_MODELS) {
     try {
-      return await callGroqVision(imageUrl, systemPrompt, model);
+      return await callGroqVision(imageUrl, systemPrompt, model, question);
     } catch (err) {
       console.error(`Modèle vision ${model} indisponible:`, err.message);
       lastError = err;
@@ -638,7 +782,7 @@ async function callGroqVisionWithFallback(imageUrl, systemPrompt) {
   throw lastError;
 }
 
-async function callGroqVision(imageUrl, systemPrompt, model) {
+async function callGroqVision(imageUrl, systemPrompt, model, question) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
@@ -649,7 +793,7 @@ async function callGroqVision(imageUrl, systemPrompt, model) {
         {
           role: "user",
           content: [
-            { type: "text", text: "Décris cette image et réponds de façon utile et chaleureuse." },
+            { type: "text", text: question },
             { type: "image_url", image_url: { url: imageUrl } },
           ],
         },
@@ -663,8 +807,6 @@ async function callGroqVision(imageUrl, systemPrompt, model) {
   return data.choices[0].message.content;
 }
 
-// Découpe un texte trop long en morceaux <= MESSENGER_TEXT_LIMIT, en coupant
-// de préférence sur un saut de ligne ou un espace plutôt qu'en plein milieu d'un mot.
 function splitForMessenger(text) {
   if (text.length <= MESSENGER_TEXT_LIMIT) return [text];
 
