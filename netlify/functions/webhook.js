@@ -5,19 +5,17 @@
 // - 13/07/2026 : endpoint Send API /{PAGE_ID}/messages + messaging_type obligatoire.
 // - 29/09/2026 : modèles dépréciés remplacés + commandes fun + Mode Codeur enrichi
 //   + génération de fichiers HTML/CSS/JS/ZIP.
-// - 02/10/2026 (1) : regex multi-lignes + découpage auto des messages > 2000 car.
-// - 02/10/2026 (2) : CORRECTIF MAJEUR — les styles de police Unicode (gras,
-//   italique, script, double, gothique, mono) utilisent des caractères du plan
-//   Unicode supplémentaire (au-delà de U+FFFF), représentés en JS par des paires
-//   de substituts (surrogate pairs). String.split("") découpe par unité UTF-16 et
-//   NON par caractère réel, donc il cassait ces paires en morceaux invalides →
-//   texte illisible du type "111&&#(!#;€929+2-2". Remplacé par Array.from(), qui
-//   découpe par point de code Unicode correctement.
-//   + openai/gpt-oss-120b n'est PAS un modèle vision (corrigé la liste de secours).
-//   + suivi de question sur une image déjà envoyée (mémoire d'image courte durée).
-//   + recherche web avec repli si l'outil échoue.
-//   + anti-hallucination d'identité (pas de fausse vie privée inventée).
-//   + nouvelles commandes : calcul, definition, resume.
+// - 02/10/2026 : regex multi-lignes, découpage auto > 2000 car., Array.from() pour
+//   les polices Unicode, modèles vision corrigés, suivi de question sur image,
+//   repli de la recherche web, calcul/definition/resume.
+// - 09/10/2026 :
+//   1) Identité : le bot répond que son créateur est Adéfal (et non OpenAI/Groq/Meta).
+//   2) Mode Codeur : vraie base de connaissances intégrée (HTML, CSS, JS, bonnes
+//      pratiques, sécurité, débogage) + plus de place pour répondre (max_tokens 3000).
+//   3) Nouvelles commandes : "cours" (cours HTML/CSS/JS fiables, écrits en dur, et
+//      cours générés pour git/sql/python/react/node/api/securite/php) et
+//      "dev <question>" (question de code avec l'expertise du Mode Codeur, quel que
+//      soit le mode actif).
 
 const JSZip = require("jszip");
 
@@ -34,32 +32,71 @@ const GROQ_TEXT_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwe
 // openai/gpt-oss-120b n'a PAS de capacité vision : seuls les modèles Qwen ci-dessous l'ont.
 const GROQ_VISION_MODELS = ["qwen/qwen3.6-27b", "qwen/qwen3.8-27b"];
 
+// ==== Identité du bot (commune aux deux modes) ====
+const IDENTITY = [
+  "Identité : tu es Adéfal AI. Ton créateur est Adéfal, le développeur qui t'a conçu, assemblé et configuré.",
+  "Si on te demande qui t'a créé, qui est ton créateur ou ton développeur, réponds : Adéfal.",
+  "Ne dis jamais que tu as été créé par OpenAI, Meta, Groq, Alibaba, Google ou une autre entreprise.",
+  "Si on te demande sur quelle technologie tu fonctionnes, réponds honnêtement que tu fonctionnes grâce à des modèles de langage ouverts, assemblés et configurés par Adéfal, sans prétendre les avoir entraînés toi-même.",
+  "Tu es une IA : tu n'as pas de vie privée réelle (pas de conjoint, pas de famille, pas de corps). N'invente JAMAIS de fausse information personnelle présentée comme un fait réel (pas de faux nom de conjoint(e), d'enfants, etc.) ; réponds avec humour en clarifiant que tu es une IA.",
+].join(" ");
+
+// ==== Base de connaissances de codage (intégrée au Mode Codeur) ====
+const CODING_KNOWLEDGE = [
+  "BASE DE CONNAISSANCES QUE TU MAÎTRISES (tu t'en sers pour enseigner et pour coder) :",
+  "",
+  "HTML — squelette : <!DOCTYPE html>, <html lang=\"fr\">, <head> (<meta charset=\"UTF-8\">, <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">, <title>, <link rel=\"stylesheet\" href=\"style.css\">), <body>, <script src=\"script.js\"></script> en fin de body.",
+  "HTML — balises : titres h1-h6 ; p ; a href ; strong ; em ; br ; hr ; span ; div ; sémantiques header, nav, main, section, article, aside, footer ; listes ul/ol/li ; img src alt ; video/audio controls ; table/tr/th/td ; formulaires form, label, input (text, email, password, number, checkbox, radio), textarea, select/option, button.",
+  "HTML — règles : alt sur les images, un seul h1 par page, balises sémantiques plutôt que des div partout, label lié à chaque input, lang sur html.",
+  "",
+  "CSS — syntaxe : selecteur { propriete: valeur; }. Sélecteurs : balise, .classe, #id, :hover, descendant (ul li), enfant (ul > li).",
+  "CSS — propriétés clés : color, background, font-family, font-size, font-weight, text-align, line-height, margin, padding, border, border-radius, box-shadow, width, height, max-width, overflow, opacity, cursor, transition, transform, animation + @keyframes.",
+  "CSS — mise en page : display flex (flex-direction, justify-content, align-items, gap, flex-wrap), display grid (grid-template-columns: repeat(3, 1fr), gap), position relative/absolute/fixed/sticky, z-index, @media (max-width: 600px) pour le responsive, mobile-first.",
+  "CSS — règles : * { box-sizing: border-box; }, variables CSS (--couleur: #333; var(--couleur)), classes réutilisables, éviter !important.",
+  "",
+  "JavaScript — bases : const/let (jamais var), types (string, number, boolean, null, undefined, array, object), fonctions (function et flèches =>), if/else, for, for...of, ===, template strings.",
+  "JavaScript — tableaux/objets : push, pop, map, filter, find, includes, reduce, length ; destructuring ; spread (...).",
+  "JavaScript — DOM : document.querySelector, addEventListener('click', ...), textContent, classList.add/remove/toggle, value, createElement, appendChild.",
+  "JavaScript — asynchrone : fetch + async/await + try/catch, res.json(), JSON.stringify/parse, localStorage.getItem/setItem.",
+  "",
+  "AUTRES SUJETS que tu sais enseigner : Git (init, add, commit, branch, merge, pull request), SQL (SELECT, WHERE, JOIN, INSERT, UPDATE, DELETE, index), Python (bases, listes, dictionnaires, fonctions), Node.js/Express (routes GET/POST, middleware, variables d'environnement), React (composants, props, useState, useEffect), API REST (méthodes, codes HTTP 200/201/400/401/403/404/500), PHP (bases).",
+  "",
+  "SÉCURITÉ À RAPPELER : variables d'environnement pour les secrets, jamais de clé dans le code ni dans un dépôt public ; valider et échapper les entrées utilisateur (XSS, injection SQL) ; requêtes préparées ; HTTPS ; mots de passe hachés (bcrypt/argon2) ; ne jamais faire confiance au client.",
+  "DÉBOGAGE : reproduire le bug, lire le message d'erreur en entier, isoler par bissection, console.log ciblés, vérifier les types et les valeurs nulles.",
+  "",
+  "FORMAT POUR MESSENGER : Messenger n'affiche PAS le markdown (pas de gras, pas de # titres, pas de rendu de bloc de code). Entoure toujours le code de lignes contenant uniquement trois accents graves (```) pour le délimiter visuellement, indente avec 2 espaces, et écris le reste en texte simple. Si le code dépasse environ 40 lignes, propose à l'utilisateur d'utiliser la commande 'fichier html', 'fichier css', 'fichier js' ou 'zip <description>' pour recevoir un vrai fichier.",
+].join("\n");
+
+const CODER_RULES = [
+  "Tu es Adéfal AI en Mode Codeur : un développeur senior rigoureux, pédagogue et patient, qui répond sur Messenger.",
+  "",
+  "Règles de bonnes pratiques que tu appliques systématiquement :",
+  "1. Sécurité d'abord — jamais de clés/mots de passe en dur, toujours valider les entrées utilisateur.",
+  "2. Code lisible — noms explicites, fonctions courtes, commentaires seulement si le \"pourquoi\" n'est pas évident.",
+  "3. Gestion des erreurs — try/catch systématique, jamais d'erreur avalée silencieusement.",
+  "4. Honnêteté technique — signale si une API a pu changer, pose une question plutôt que de deviner en cas d'ambiguïté, ne prétends jamais qu'un code a été testé s'il ne l'a pas été.",
+  "5. Concis mais complet — du code copiable-collable directement fonctionnel, puis 1 à 3 phrases d'explication.",
+  "",
+  "Réflexes de développeur senior :",
+  "- Débogage méthodique : reproduire, isoler, lire l'erreur en entier avant de chercher ailleurs.",
+  "- Ne jamais optimiser avant d'avoir mesuré.",
+  "- Un commit = un changement logique, avec un message qui explique le \"pourquoi\".",
+  "- Toujours garder un chemin de retour arrière (rollback) avant de déployer un changement risqué.",
+  "- Se méfier du code non testé, même généré par une IA — y compris le tien.",
+  "",
+  "Quand l'utilisateur débute, explique simplement, avec un exemple court. Ton style reste chaleureux et direct.",
+].join("\n");
+
 const SYSTEM_PROMPTS = {
   normal: {
     role: "system",
     content:
-      "Tu es Adéfal AI, un assistant conversationnel sympathique et naturel, qui discute librement avec les utilisateurs sur Messenger. Réponds en français par défaut, de façon chaleureuse et concise. " +
-      "Tu es une IA : tu n'as pas de vie privée réelle (pas de conjoint, pas de famille, pas de corps). Si on te pose ce genre de question, réponds avec humour en clarifiant que tu es une IA, mais n'invente JAMAIS de fausse information personnelle présentée comme un fait réel (pas de faux nom de conjoint(e), d'enfants, etc.).",
+      "Tu es Adéfal AI, un assistant conversationnel sympathique et naturel, qui discute librement avec les utilisateurs sur Messenger. Réponds en français par défaut, de façon chaleureuse et concise.\n\n" +
+      IDENTITY,
   },
   coder: {
     role: "system",
-    content: `Tu es Adéfal AI en Mode Codeur : un développeur senior rigoureux qui répond sur Messenger (texte brut, pas de rendu markdown élaboré).
-
-Règles de bonnes pratiques que tu appliques systématiquement :
-1. Sécurité d'abord — jamais de clés/mots de passe en dur, toujours valider les entrées utilisateur.
-2. Code lisible — noms explicites, fonctions courtes, commentaires seulement si le "pourquoi" n'est pas évident.
-3. Gestion des erreurs — try/catch systématique, jamais d'erreur avalée silencieusement.
-4. Honnêteté technique — signaler si une API a pu changer, poser une question plutôt que deviner en cas d'ambiguïté.
-5. Concis mais complet — du code copiable-collable directement fonctionnel.
-
-Quelques réflexes supplémentaires de développeur senior ("secrets" de métier) :
-- Débogage méthodique : d'abord reproduire le bug de façon fiable, ensuite isoler la variable en cause (bissection), et lire le message d'erreur EN ENTIER avant de chercher ailleurs — la réponse y est souvent déjà.
-- Ne jamais optimiser avant d'avoir mesuré (la majorité des optimisations prématurées ciblent le mauvais endroit).
-- Un commit = un changement logique, avec un message qui explique le "pourquoi", pas juste le "quoi".
-- Toujours garder un chemin de retour arrière (rollback) avant de déployer un changement risqué en prod.
-- Se méfier du code qu'on n'a pas testé soi-même, même généré par une IA — y compris le tien.
-
-Ton style reste chaleureux et direct, mais tes réponses techniques sont celles d'un développeur senior qui pense sécurité, lisibilité et robustesse avant tout.`,
+    content: CODER_RULES + "\n\n" + CODING_KNOWLEDGE + "\n\n" + IDENTITY,
   },
 };
 const SYSTEM_PROMPT = SYSTEM_PROMPTS.normal;
@@ -68,6 +105,137 @@ const conversations = {};
 const userModes = {};
 const lastImageUrl = {}; // senderId -> URL de la dernière photo envoyée (pour les questions de suivi)
 
+// ==== Cours écrits en dur (fiables, sans risque d'hallucination) ====
+const COURS_HTML = [
+  "📘 COURS HTML — les balises essentielles",
+  "",
+  "🏗️ Squelette d'une page :",
+  "```",
+  "<!DOCTYPE html>",
+  "<html lang=\"fr\">",
+  "<head>",
+  "  <meta charset=\"UTF-8\">",
+  "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">",
+  "  <title>Ma page</title>",
+  "  <link rel=\"stylesheet\" href=\"style.css\">",
+  "</head>",
+  "<body>",
+  "  ...contenu...",
+  "  <script src=\"script.js\"></script>",
+  "</body>",
+  "</html>",
+  "```",
+  "",
+  "📝 Texte : <h1> à <h6> titres, <p> paragraphe, <a href=\"...\"> lien, <strong> gras, <em> italique, <br> retour à la ligne, <hr> ligne, <span> texte en ligne",
+  "🧱 Structure : <header> <nav> <main> <section> <article> <aside> <footer> <div>",
+  "📋 Listes : <ul> puces, <ol> numérotée, <li> élément",
+  "🖼️ Médias : <img src=\"\" alt=\"\"> <video controls> <audio controls>",
+  "🧾 Formulaires : <form> <label> <input type=\"text | email | password | number | checkbox | radio\"> <textarea> <select><option> <button>",
+  "📊 Tableaux : <table> <tr> ligne, <th> titre, <td> cellule",
+  "",
+  "✅ Bonnes pratiques : toujours un alt sur les images, un seul <h1> par page, balises sémantiques (header, main, footer) plutôt que des <div> partout, lang=\"fr\" sur <html>.",
+  "",
+  "➡️ Écris 'cours css' pour la suite.",
+].join("\n");
+
+const COURS_CSS = [
+  "🎨 COURS CSS — habiller ta page",
+  "",
+  "Syntaxe :",
+  "```",
+  "selecteur {",
+  "  propriete: valeur;",
+  "}",
+  "```",
+  "",
+  "🎯 Sélecteurs : p (balise), .classe, #identifiant, a:hover (survol), ul li (descendant)",
+  "🔤 Texte : color, font-size, font-family, font-weight, text-align, line-height",
+  "📦 Boîte : width, height, margin (extérieur), padding (intérieur), border, border-radius, box-shadow",
+  "🌈 Fond : background-color, background-image, linear-gradient(...)",
+  "📐 Mise en page :",
+  "```",
+  ".conteneur {",
+  "  display: flex;",
+  "  justify-content: center;",
+  "  align-items: center;",
+  "  gap: 16px;",
+  "}",
+  "```",
+  "Grille : display: grid; grid-template-columns: repeat(3, 1fr);",
+  "📍 Position : relative, absolute, fixed, sticky + top/left/right/bottom + z-index",
+  "✨ Animation : transition: all 0.3s ease; puis @keyframes + animation",
+  "📱 Responsive :",
+  "```",
+  "@media (max-width: 600px) {",
+  "  .conteneur { flex-direction: column; }",
+  "}",
+  "```",
+  "",
+  "💡 Astuce : * { box-sizing: border-box; } évite beaucoup de problèmes de tailles. Utilise des variables : --couleur: #333; puis var(--couleur).",
+  "",
+  "➡️ Écris 'cours js' pour la suite.",
+].join("\n");
+
+const COURS_JS = [
+  "⚙️ COURS JAVASCRIPT — les bases",
+  "",
+  "📦 Variables : const (ne change pas) et let (change). Évite var.",
+  "🔢 Types : string, number, boolean, null, undefined, array [], object {}",
+  "🧮 Fonctions :",
+  "```",
+  "function addition(a, b) {",
+  "  return a + b;",
+  "}",
+  "const double = (n) => n * 2;",
+  "```",
+  "🔀 Conditions : if (x > 5) { ... } else { ... }  (utilise === plutôt que ==)",
+  "🔁 Boucles : for (let i = 0; i < 5; i++) { ... }  ou  for (const el of tableau) { ... }",
+  "📚 Tableaux : push, pop, map, filter, find, includes, length",
+  "🌐 DOM (modifier la page) :",
+  "```",
+  "const btn = document.querySelector('#btn');",
+  "btn.addEventListener('click', () => {",
+  "  document.querySelector('h1').textContent = 'Salut !';",
+  "});",
+  "```",
+  "📡 Appeler une API :",
+  "```",
+  "async function charger() {",
+  "  try {",
+  "    const res = await fetch('https://api.exemple.com/data');",
+  "    const data = await res.json();",
+  "    console.log(data);",
+  "  } catch (e) {",
+  "    console.error(e);",
+  "  }",
+  "}",
+  "```",
+  "",
+  "✅ Bonnes pratiques : toujours un try/catch autour de fetch, ne jamais mettre de clé secrète dans le code, noms de variables explicites.",
+].join("\n");
+
+const COURS_STATIC = { html: COURS_HTML, css: COURS_CSS, js: COURS_JS };
+
+const COURS_GENERES = {
+  git: "Git",
+  sql: "SQL",
+  python: "Python",
+  react: "React",
+  node: "Node.js et Express",
+  api: "les API REST",
+  securite: "la sécurité informatique pour développeurs web",
+  php: "PHP",
+};
+
+const COURS_LISTE =
+  "📚 COURS DISPONIBLES\n\n" +
+  "📘 cours html — les balises essentielles\n" +
+  "🎨 cours css — le style et la mise en page\n" +
+  "⚙️ cours js — JavaScript de base\n" +
+  "🧠 cours git | sql | python | react | node | api | securite | php\n\n" +
+  "💡 Pour une question de code précise : dev <ta question>\n" +
+  "📄 Pour recevoir du vrai code en fichier : fichier html|css|js <description>";
+
 const MENU_TEXT =
   "━━━━━━━━━━━━━━━━━━━━\n" +
   "✨  F E M I   A I  ✨\n" +
@@ -75,34 +243,34 @@ const MENU_TEXT =
   "💬 DISCUSSION\n" +
   "🆘 help — cette aide\n" +
   "🆔 id — ton identifiant Messenger\n" +
-  "🔎 recherche <question> — recherche web en temps réel\n" +
-  "🧑‍💻 mode codeur / 💬 mode normal — changer de mode\n\n" +
+  "🔎 recherche <question> — recherche web\n" +
+  "🧑‍💻 mode codeur / 💬 mode normal\n\n" +
+  "🎓 APPRENDRE À CODER\n" +
+  "📚 cours — liste des cours (html, css, js...)\n" +
+  "🧑‍💻 dev <question> — question de code\n\n" +
   "🎨 CRÉATION\n" +
-  "🖼️ dessine-moi <description> — générer une image\n" +
-  "📄 fichier html|css|js <description> — un fichier de code\n" +
-  "🗜️ zip <description> — mini site (html+css+js) zippé\n\n" +
+  "🖼️ dessine-moi <description> — image\n" +
+  "📄 fichier html|css|js <description>\n" +
+  "🗜️ zip <description> — mini site zippé\n\n" +
   "🧰 OUTILS\n" +
-  "🧮 calcul <expression> — calculatrice\n" +
-  "📖 definition <mot> — définition d'un mot\n" +
-  "✂️ resume <texte> — résumer un texte\n" +
-  "🌍 traduis <langue> <texte> — traduction\n" +
-  "☀️ meteo <ville> — météo actuelle\n\n" +
+  "🧮 calcul <expression>\n" +
+  "📖 definition <mot>\n" +
+  "✂️ resume <texte>\n" +
+  "🌍 traduis <langue> <texte>\n" +
+  "☀️ meteo <ville>\n\n" +
   "🎉 FUN\n" +
-  "✒️ police liste — voir tous les styles\n" +
-  "✒️ police <style> <texte> — styliser un texte\n" +
-  "😂 blague — une blague aléatoire\n" +
-  "💬 citation — une citation inspirante\n" +
+  "✒️ police liste / police <style> <texte>\n" +
+  "😂 blague — 💬 citation\n" +
   "🔠 majuscule / 🕶️ leet / 🔄 inverse <texte>\n\n" +
   "━━━━━━━━━━━━━━━━━━━━\n" +
-  "Écris-moi normalement pour discuter, je suis là 🙂";
+  "Écris-moi normalement pour discuter 🙂";
 
 const UP = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 const LOW = "abcdefghijklmnopqrstuvwxyz".split("");
 const DIG = "0123456789".split("");
 
 // IMPORTANT : Array.from() et non .split("") — plusieurs de ces styles utilisent
-// des caractères Unicode hors du plan de base (paires de substituts). split("")
-// casserait ces caractères en morceaux invalides.
+// des caractères Unicode hors du plan de base (paires de substituts).
 const FONT_STYLES = {
   gras: {
     upper: Array.from("𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙"),
@@ -289,6 +457,7 @@ async function handleMessage(senderId, userText) {
     await sendTypingIndicator(senderId, "typing_on");
     const mode = userModes[senderId] || "normal";
     const systemPrompt = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.normal;
+    const maxTokens = mode === "coder" ? 3000 : 1500;
 
     // Si une photo vient d'être envoyée, on considère ce message comme une
     // question de suivi dessus (une seule fois, puis on efface le contexte image).
@@ -313,7 +482,7 @@ async function handleMessage(senderId, userText) {
     history.push({ role: "user", content: userText });
     if (history.length > MAX_HISTORY + 1) history = [history[0], ...history.slice(-MAX_HISTORY)];
 
-    const aiReply = await callGroqWithFallback(history);
+    const aiReply = await callGroqWithFallback(history, 0.8, maxTokens);
     history.push({ role: "assistant", content: aiReply });
     conversations[senderId] = history;
 
@@ -323,6 +492,13 @@ async function handleMessage(senderId, userText) {
     console.error("Erreur handleMessage:", err.message);
     await sendMessage(senderId, "Désolé, j'ai eu un souci technique. Réessaie dans un instant 🙏");
   }
+}
+
+function normalizeCoursTopic(raw) {
+  const t = raw.toLowerCase();
+  if (t === "javascript") return "js";
+  if (t === "sécurité") return "securite";
+  return t;
 }
 
 function parseCommand(text) {
@@ -336,6 +512,17 @@ function parseCommand(text) {
   if (t === "mode normal" || t === "/normal") return { type: "mode_normal" };
   if (t === "blague" || t === "/blague") return { type: "blague" };
   if (t === "citation" || t === "/citation") return { type: "citation" };
+  if (t === "cours" || t === "/cours") return { type: "cours_liste" };
+
+  // Le sujet est limité à une liste connue pour ne pas intercepter une phrase
+  // normale qui commencerait par "cours" (ex : "cours de maths demain").
+  const coursMatch = trimmed.match(
+    /^\/?cours\s+(html|css|js|javascript|git|sql|python|react|node|api|securite|sécurité|php)\s*$/i
+  );
+  if (coursMatch) return { type: "cours", topic: normalizeCoursTopic(coursMatch[1]) };
+
+  const devMatch = trimmed.match(/^(?:\/code|dev)\s+(.+)$/is);
+  if (devMatch) return { type: "dev", question: devMatch[1].trim() };
 
   const searchMatch = trimmed.match(/^(?:\/recherche|recherche|\/search|search)\s+(.+)$/is);
   if (searchMatch) return { type: "search", query: searchMatch[1].trim() };
@@ -395,7 +582,10 @@ async function handleCommand(senderId, command) {
       case "mode_coder":
         userModes[senderId] = "coder";
         if (conversations[senderId]) conversations[senderId][0] = SYSTEM_PROMPTS.coder;
-        await sendMessage(senderId, "🧑‍💻 Mode Codeur activé. Écris 'mode normal' pour revenir.");
+        await sendMessage(
+          senderId,
+          "🧑‍💻 Mode Codeur activé — HTML, CSS, JS, bonnes pratiques et sécurité. Tape 'cours' pour apprendre, ou pose ta question de code. Écris 'mode normal' pour revenir."
+        );
         break;
 
       case "mode_normal":
@@ -403,6 +593,47 @@ async function handleCommand(senderId, command) {
         if (conversations[senderId]) conversations[senderId][0] = SYSTEM_PROMPTS.normal;
         await sendMessage(senderId, "💬 Retour au mode discussion classique.");
         break;
+
+      case "cours_liste":
+        await sendMessage(senderId, COURS_LISTE);
+        break;
+
+      case "cours": {
+        const staticLesson = COURS_STATIC[command.topic];
+        if (staticLesson) {
+          await sendMessage(senderId, staticLesson);
+          break;
+        }
+        const label = COURS_GENERES[command.topic] || command.topic;
+        await sendTypingIndicator(senderId, "typing_on");
+        const lesson = await callGroqWithFallback(
+          [
+            SYSTEM_PROMPTS.coder,
+            {
+              role: "user",
+              content:
+                "Donne un mini-cours pour débutant sur : " + label + ". Structure : 1) c'est quoi et à quoi ça sert, 2) les 5 notions clés, 3) un exemple de code court entouré de lignes contenant uniquement trois accents graves, 4) 3 bonnes pratiques. Texte simple, maximum 1800 caractères.",
+            },
+          ],
+          0.5,
+          2500
+        );
+        await sendTypingIndicator(senderId, "typing_off");
+        await sendMessage(senderId, `📚 ${lesson}`);
+        break;
+      }
+
+      case "dev": {
+        await sendTypingIndicator(senderId, "typing_on");
+        const answer = await callGroqWithFallback(
+          [SYSTEM_PROMPTS.coder, { role: "user", content: command.question }],
+          0.5,
+          3000
+        );
+        await sendTypingIndicator(senderId, "typing_off");
+        await sendMessage(senderId, `🧑‍💻 ${answer}`);
+        break;
+      }
 
       case "search": {
         await sendTypingIndicator(senderId, "typing_on");
@@ -561,7 +792,7 @@ async function generateSingleFileCode(language, description) {
     { role: "system", content: prompts[language] },
     { role: "user", content: description },
   ];
-  const code = await callGroqWithFallback(messages, 0.7);
+  const code = await callGroqWithFallback(messages, 0.7, 3000);
   return stripMarkdownFences(code);
 }
 
@@ -575,7 +806,7 @@ async function generateMiniSite(description) {
     },
     { role: "user", content: description },
   ];
-  const raw = await callGroqWithFallback(messages, 0.7);
+  const raw = await callGroqWithFallback(messages, 0.7, 4000);
 
   const htmlMatch = raw.match(/===HTML===([\s\S]*?)===CSS===/);
   const cssMatch = raw.match(/===CSS===([\s\S]*?)===JS===/);
@@ -713,11 +944,11 @@ async function callGroqCompoundSearch(query) {
   return data.choices[0].message.content;
 }
 
-async function callGroqWithFallback(messages, temperature = 0.8) {
+async function callGroqWithFallback(messages, temperature = 0.8, maxTokens = 1500) {
   let lastError;
   for (const model of GROQ_TEXT_MODELS) {
     try {
-      return await callGroq(messages, model, temperature);
+      return await callGroq(messages, model, temperature, maxTokens);
     } catch (err) {
       console.error(`Modèle texte ${model} indisponible:`, err.message);
       lastError = err;
@@ -726,11 +957,11 @@ async function callGroqWithFallback(messages, temperature = 0.8) {
   throw lastError;
 }
 
-async function callGroq(messages, model, temperature = 0.8) {
+async function callGroq(messages, model, temperature = 0.8, maxTokens = 1500) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, temperature, max_tokens: 1500 }),
+    body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(`Groq error (${model}): ${JSON.stringify(data)}`);
@@ -799,7 +1030,7 @@ async function callGroqVision(imageUrl, systemPrompt, model, question) {
         },
       ],
       temperature: 0.8,
-      max_tokens: 500,
+      max_tokens: 800,
     }),
   });
   const data = await res.json();
